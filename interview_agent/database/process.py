@@ -1,24 +1,38 @@
-from .models import Interview, Organization, Applicant, User
+from .models import Interview, Organization, Applicant, User, InterviewType
 from .db import sessionLocal
 from pydantic import BaseModel
 from datetime import datetime
+from typing import Optional
 
 
 class jobRequirements(BaseModel):
    role: str
-   languages: dict[str, int]
-   domain: dict[str, int]
+   languages: list[dict[str, int]]
+   domains: list[dict[str, int]]
    softskills: list[str]
 
-def convert_requirements_tostr(job_requirements: jobRequirements):
-    parts = []
-    parts.append(f"job role: {job_requirements.role}")
-    for skill, years in job_requirements.languages.items():
-        parts.append(f"{skill} with {years} years experience")
-    for domain, level in job_requirements.domain.items():
-        parts.append(f"{domain} with {level} level")
-    parts.extend(job_requirements.softskills)
-    return ", ".join(parts)
+def convert_requirements_tostr(job_requirements: jobRequirements) -> str:
+    
+    result = f"Role: {job_requirements.role}\n"
+    
+    if job_requirements.languages:
+        result += "Languages:\n"
+        for lang in job_requirements.languages:
+            for name, years in lang.items():
+                result += f"  - {name}: {years} years\n"
+    
+    if job_requirements.domains:
+        result += "Domains:\n"
+        for domain in job_requirements.domains:
+            for name, years in domain.items():
+                result += f"  - {name}: {years} years\n"
+    
+    if job_requirements.softskills:
+        result += "Softskills:\n"
+        for skill in job_requirements.softskills:
+            result += f"  - {skill}\n"
+    
+    return result
 
 
 def create_UserDB(name: str, email: str,password: str)  ->User:
@@ -29,6 +43,9 @@ def create_UserDB(name: str, email: str,password: str)  ->User:
       db.commit()
       db.refresh(user)
       return user
+   except Exception as e:
+      db.rollback()
+      raise
    finally:
       db.close()
 
@@ -97,15 +114,25 @@ def create_organizationDB(name: str, email: str, password: str) -> Organization:
 
 
 
-def create_InterviewDB(name: str, role: str, job_requirements: jobRequirements, organizationId: str,start_date: datetime, end_date: datetime, duration: int, base_question: str) -> Interview:
+def create_InterviewDB(role: str, type: str, description: str, job_requirements: jobRequirements, start_date: datetime, end_date: datetime, duration: int, base_question: str, organization_id: Optional[str] = None, user_id: Optional[str] = None) -> Interview:
     db = sessionLocal()
     try:
-       stringJobReuiremnts = convert_requirements_tostr(job_requirements)
-       interview = Interview(name=name, role=role, job_requirements=stringJobReuiremnts, organization_id=organizationId, start_date=start_date, end_date=end_date, duration=duration, base_question=base_question)
+       stringJobRequiremnts = convert_requirements_tostr(job_requirements)
+       if type == InterviewType.organization:
+          if organization_id is None:
+             raise Exception("must use either user or organization") 
+          interview = Interview( role=role, type=type, description=description, job_requirements=stringJobRequiremnts, organization_id=organization_id, start_date=start_date, end_date=end_date, duration=duration, base_question=base_question)
+       elif type == InterviewType.user:
+          if user_id is None:
+             raise Exception("must use either user or organization")
+          interview = Interview( role=role,type=type, description=description, job_requirements=stringJobRequiremnts, user_id=user_id, start_date=start_date, end_date=end_date, duration=duration, base_question=base_question)
        db.add(interview)
        db.commit()
        db.refresh(interview)
        return interview
+    except Exception as e:
+       db.rollback()
+       raise
     finally:
        db.close()
     
@@ -113,7 +140,10 @@ def get_interview_questions(interview_id: str):
    db = sessionLocal()
    try:
       interview = db.query(Interview).filter(Interview.id == interview_id).first()
-      return interview.base_question
+      return interview.base_question, interview.duration
+   except Exception as e:
+      db.rollback()
+      raise
    finally:
       db.close()
 
@@ -132,6 +162,9 @@ def get_applicant_questions(applicant_id: str):
         if not applicant:
             return None  
         return applicant.full_question
+    except Exception as e:
+       db.rollback()
+       raise
     finally:
         db.close()
 
@@ -142,6 +175,9 @@ def create_ApplicantDB(name: str, resume: bytes, full_question: str, interview_i
       db.add(applicant)
       db.commit()
       db.refresh(applicant)
+   except Exception as e:
+      db.rollback()
+      raise
    finally:
       db.close()
 

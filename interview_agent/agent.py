@@ -19,13 +19,13 @@ def create_base_interview_questions(job_requirements: str, n: int = 5):
     """
     Generate base questions with the job requirements
     """
-    # search for each requirement separately for better coverage
+ 
     terms = [t.strip() for t in job_requirements.replace(',', ' ').split() if len(t) > 3]
     
     seen_ids = set()
     all_results = []
 
-    for term in terms[:5]:  
+    for term in terms:  
         vector = encoder.encode(term).tolist()
         results = client.query_points(
             collection_name=COLLECTION,
@@ -58,7 +58,13 @@ question_agent = Agent(
     """,
     instruction= """
     Use the create_base_interview_questions tool ONCE to fetch questions using the job_requirements.
-    Then select and rephrase up to 40 questions that cover most of the job requirements.
+    The number of questions would be determined by the interview duration provided:
+      30-40minutes: 15 - 25 questions
+      20-30minutes: 10 - 15 questions
+      10-20minutes: 5 - 10 questions
+    Pick lower range of questions if the experience is higher but increase difficulty of questions, and 
+    vice vera.
+    Then select and rephrase all questions that cover most of the job requirements.
     Focus on pragmatic and conceptual questions — do not ask candidates to write code, 
     instead ask how they would approach or think about programming problems.
     Return only the questions grouped by their job requirement section. Format like this:
@@ -84,6 +90,12 @@ resume_agent = Agent(
     """,
     instruction="""
     Generate a list of questions based on the resume provided.
+    The number of interview questions is based on the interview duraton:
+     30-40 minuties - 15 questions
+     20-30 minutes - 10 questions
+     10-30 minutes - 5 questions
+    Pick lower range of questions if the experience is higher but increase difficulty of questions, and 
+    vice vera.
     Return a list of 5 to 15 questions with the header "Resume-Based Questions" at the top.
     Each question on its own numbered line.
 
@@ -115,30 +127,5 @@ resume_agent = Agent(
     )
 
 )
-vision_agent = Agent(
-    model='gemini-2.5-computer-use-preview-10-202',
-    name='vision_agent',
-    description="""You are a video analysis agent that 
-    for detecting anomalities during a meeting""",
-    instruction="""You are video analysis inspector that detects abnormalities or signs of malpractice during
-    an interview.
-    If see one of the following report:
-      - User looking way from the screen(light)
-      - User  bringing another device on screen(heavy)
-      - User typing on keyboard(heavy)
-      - User leaving the screen during the interview(heavy)
 
-    
-     .""",
-
-)
-
-visionApp = App(
-    name="vision_app",
-    root_agent=vision_agent,
-    events_compaction_config= EventsCompactionConfig(
-        compaction_interval=3,
-        overlap_size=1
-    ),
-)
 

@@ -19,15 +19,21 @@ from google.genai.types import Content, Part,  FunctionCallingConfig, Modality
 from google.adk.agents.llm_agent import Agent
 from google.adk.apps.app import App
 from google.adk.apps.app import EventsCompactionConfig
-from fastapi import FastAPI, Depends, UploadFile, File, WebSocket, HTTPException, Form
+from fastapi import FastAPI, Depends, UploadFile, File, WebSocket, HTTPException, Form, Response, Request
 from fastapi.websockets import WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 import pymupdf
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator, ValidationError
+from typing import Optional
+
 from database.process import create_UserDB,create_InterviewDB, create_organizationDB, jobRequirements, convert_requirements_tostr
 from database.process import get_interview_questions, create_ApplicantDB, get_applicant_questions, get_interview_timer, fetch_applicantId_interview
 from database.process import fetch_interview, fetch_applicant
-from interview_agent.agent import question_agent, resume_agent, visionApp
+from database.db import sessionLocal
+from database.models import  Organization, User, InterviewType
+
+from interview_agent.agent import question_agent, resume_agent
+from google.adk.agents.context_cache_config import ContextCacheConfig
 from datetime import datetime
 from google import genai
 import base64
@@ -47,19 +53,43 @@ class UserRequest(BaseModel):
     password: str
 
 
+class UserLoginRequest(BaseModel):
+    email: str
+    password: str
+
+
 class OrganizationRequest(BaseModel):
     name: str
     email: str
     password: str
 
-class InterviewRequest(BaseModel): 
-    name: str
+class OrganizationLoginRequest(BaseModel):
+    email: str
+    password: str
+
+class InterviewRequest(BaseModel):
     role: str
+    description: str
     job_requirements: jobRequirements
-    organization_id: str
     start_date: datetime
     end_date: datetime
     duration: int
+    organization_id: Optional[str] = None
+
+    @field_validator('duration')
+    @classmethod
+    def validate_duration(cls, v: int) -> int:
+        if not 10 <= v <= 40:
+            raise ValueError('Duration must be between 10 and 40 minutes')
+        return v
+
+    @field_validator('end_date')
+    @classmethod
+    def validate_dates(cls, v: datetime, info) -> datetime:
+        start_date = info.data.get('start_date')
+        if start_date and isinstance(start_date, datetime) and v <= start_date:
+            raise ValueError('End date must be after start date')
+        return v
 
 
 
@@ -75,10 +105,11 @@ session_service = InMemorySessionService()
 
 
 
-async def create_interview_base_questions(message: str):
+async def create_interview_base_questions(message: str, duration: int):
     runner = Runner(agent=question_agent, app_name="interview", session_service=session_service)
     prompt = f"""
-      Generate questions using job_requirements: {message}
+       With this interview duration: {duration} minutes.
+         Generate questions using job_requirements: {message}
     """
     print("creating base questions")
     session = await session_service.create_session(app_name="interview", user_id="create_base_question")
@@ -97,10 +128,10 @@ async def create_interview_base_questions(message: str):
         if event.is_final_response():
             return event.content.parts[0].text
 
-async def create_interview_full_questions(message: str):
+async def create_interview_full_questions(message: str, duration: int):
     runner = Runner(agent=resume_agent, app_name="interview", session_service=session_service)
     prompt = f"""
-      Generate questions using  this resume: {message}
+      Generate questions using  this resume: {message} with this number of minutes {duration}
     """
     session = await session_service.create_session(app_name="interview", user_id="full_question")
   
@@ -122,23 +153,46 @@ async def create_interview_full_questions(message: str):
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],  # your React dev server
+    allow_origins=["http://localhost:5173"],  
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )  
 
 @app.post("/User/create")
-async def create_user(request: UserRequest):
+async def create_user(request: UserRequest, response: Response):
   try:
     hashed = bcrypt.hashpw(request.password.encode('utf-8'),  bcrypt.gensalt())
     hashed_password_string = hashed.decode('utf-8')
-    create_UserDB(request.name, request.email, hashed_password_string)
-    return {"status": "ok"}
+    user = create_UserDB(request.name, request.email, hashed_password_string)
+    response.set_cookie(
+        key="org_id",
+        value=str(user.id),
+        httponly=True,
+        secure=False,  
+        samesite="lax",
+        max_age=60*60*24*7  
+    )
+    return {"status": "ok", "id": user.id}
   except Exception as e:
       print(e)
       raise HTTPException(status_code=500, detail=str(e))
-  
+
+
+@app.get("/User")
+async def get_username(request: Request):
+   db= sessionLocal()
+   try:
+       user_id = request.cookies.get("user_id")
+       if not user_id:
+          raise HTTPException(status_code=401, detail="Not authenticated")
+       user = db.query(User).filter(User.id == user_id).first()
+       return {"name": user.name}
+   except Exception as e:
+       print(e)
+       raise HTTPException(status_code=500,detail=str(e))
+   finally:
+       db.close()
 
 @app.get("/User/{user_id}/applicant/interviews")
 async def get_user_applicant(user_id: str):
@@ -149,30 +203,178 @@ async def get_user_applicant(user_id: str):
       print(e)
       raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/User/login/")
+async def login_user(request: UserLoginRequest, response: Response):
+    db = sessionLocal()
+    try:
+        
+        user = db.query(User).filter(User.email == request.email).first()
+        
+        if user is not None:
+            check_password = bcrypt.checkpw(request.password.encode('utf-8'), user.password.encode('utf-8'))
+            if not user or not check_password:
+                raise HTTPException(status_code=401, detail="Invalid credentials")            
+            if check_password:
+                response.set_cookie(
+                    key="user_id",
+                    value=user.id,
+                    httponly=True,
+                    secure=False,  
+                    samesite="lax",
+                    max_age=60*60*24*7  
+                )
+                return {"status": "ok", "id": str(user.id)}
+            
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(e)
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+
+
+@app.get("/User/me")
+async def get_me(request: Request):
+    user_id = request.cookies.get("user_id")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    
+    db = sessionLocal()
+    try:
+        user = db.query(User).filter(User.id == user_id).first()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        return {"id": user.id, "name": user.name, "email": user.email}
+    except Exception as e:
+        print(e)
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+
+@app.get("/Organization/me")
+async def get_org_me(request: Request):
+    org_id = request.cookies.get("org_id")
+    if not org_id:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    
+    db = sessionLocal()
+    try:
+        org = db.query(Organization).filter(Organization.id == org_id).first()
+        if not org:
+            raise HTTPException(status_code=404, detail="Organization not found")
+        return {"id": str(org.id), "name": org.name, "email": org.email}
+    finally:
+        db.close()
 
 
 @app.post("/Organization/create") 
-async def create_organization(request: OrganizationRequest):
+async def create_organization(request: OrganizationRequest, response: Response):
   try:
     hashed = bcrypt.hashpw(request.password.encode('utf-8'),  bcrypt.gensalt())
     hashed_password_string = hashed.decode('utf-8')
-    create_organizationDB(request.name, request.email, hashed_password_string)
-    return {"status": "ok"}
+    org = create_organizationDB(request.name, request.email, hashed_password_string)
+    response.set_cookie(
+        key="user_id",
+        value=org.id,
+        httponly=True,
+        secure=False,  
+        samesite="lax",
+        max_age=60*60*24*7  
+    )
+    return {"status": "ok", "id" : org.id}
   except Exception as e:
       print(e)
       raise HTTPException(status_code=500, detail=str(e))
 
+
+@app.post("/Organization/login")
+async def login_Orgainization(request: OrganizationLoginRequest, response: Response):
+    db = sessionLocal()
+    try:
+        org = db.query(Organization).filter(Organization.email == request.email).first()
+        if org  is not None:
+            checkpassword = bcrypt.checkpw(request.password.encode('utf-8'), org.password.encode('utf-8') ) 
+            if checkpassword:
+                response.set_cookie(
+                    key="org_id",
+                    value=org.id,
+                    httponly=True,
+                    secure=False,  
+                    samesite="lax",
+                    max_age=60*60*24*7  
+                )
+                
+                return {"status": "ok", "id": org.id}
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(e)
+        raise HTTPException(status_code=500, detail=str(e))
+    
+
+
 @app.post("/Interview/create")
 async def create_interview(request: InterviewRequest):
-  try:
-    stringJobRequirements = convert_requirements_tostr(request.job_requirements)
-    base_question = await create_interview_base_questions(stringJobRequirements)
-    print(f"3. base questions: {base_question}")
-    create_InterviewDB(request.name, request.role, request.job_requirements, request.organization_id, request.start_date, request.end_date, request.duration, base_question)
-    return {"status": "ok"}
-  except Exception as e:
-     print(e)
-     raise HTTPException(status_code=500, detail=str(e))
+    try:
+        print(f"Received request: {request.model_dump()}")
+      
+        stringJobRequirements = convert_requirements_tostr(request.job_requirements)
+        
+       
+        base_question = await create_interview_base_questions(
+            stringJobRequirements, 
+            request.duration
+        )
+        print(f"3. base questions: {base_question}")
+        
+      
+        if request.organization_id is not None:
+            interview_type = InterviewType.organization
+            interview_id = create_InterviewDB(
+                request.role, 
+                interview_type,
+                request.description, 
+                request.job_requirements, 
+                request.start_date, 
+                request.end_date, 
+                request.duration, 
+                base_question, 
+                organization_id=request.organization_id,
+                user_id=None
+            )
+        else: 
+            interview_type = InterviewType.user
+            interview = create_InterviewDB(
+                request.role, 
+                interview_type,
+                request.description, 
+                request.job_requirements, 
+                request.start_date, 
+                request.end_date, 
+                request.duration, 
+                base_question, 
+                organization_id=None,
+                user_id=request.user_id
+            )
+
+            interview_id = interview.id
+        
+        return {
+            "status": "ok",
+            "interview_id": interview_id,
+            "type": interview_type.value  
+        }
+    except ValidationError as e:
+        print(f"Validation error: {e}")
+        raise
+    except HTTPException:
+        raise  
+    except Exception as e:
+        print(f"Error creating interview: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/Interview/{interview_id}")
 async def get_interview(interview_id: str):
@@ -197,7 +399,7 @@ async def get_applicant(applicant_id: str):
         raise HTTPException(status_code=500, detail=str(e))
    
 @app.post("/Applicant/create/")
-async def sign_up_for_interview(interview_id: str, applicant: str = Form(...),  file: UploadFile = File(...)):
+async def sign_up_for_interview(request: Request, interview_id: str, applicant: str = Form(...),  file: UploadFile = File(...)):
   try: 
     applicant_data = json.loads(applicant)
     applicant_req = ApplicantRequest(**applicant_data)
@@ -206,8 +408,8 @@ async def sign_up_for_interview(interview_id: str, applicant: str = Form(...),  
     doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
 
     resume = " ".join(page.get_text() for page in doc)
-    base_questions = get_interview_questions(interview_id)
-    domain_questions =  await create_interview_full_questions(resume)
+    base_questions, duration = get_interview_questions(interview_id)
+    domain_questions =  await create_interview_full_questions(resume, duration)
     full_question = domain_questions + base_questions
     create_ApplicantDB(applicant_req.name, pdf_bytes, full_question, interview_id, applicant_req.user_id)
     return {"status": "ok"}
@@ -366,12 +568,18 @@ async def audio_interview(websocket: WebSocket, interview_id: str, applicant_id:
          compaction_interval=10,
          overlap_size=5
       ),
+      context_cache_config=ContextCacheConfig(
+        min_tokens=2048,    
+        ttl_seconds=600,    
+        cache_intervals=5, 
+      ),
     )
   try:
      await asyncio.wait_for(run_interview(websocket,applicant_id, interview_app), timeout=duration*60)
   except asyncio.TimeoutError:
      await websocket.send_text(json.dumps({"ended": True, "reason": "time_limit_reached"}))
      await websocket.close()
+
 
 
 async def analyze_interview(interview_id: str, applicant_id: str):
@@ -388,13 +596,11 @@ async def analyze_interview(interview_id: str, applicant_id: str):
     import imageio
     video_path = f"/tmp/{interview_id}_{applicant_id}.mp4"
 
-    # stream frames one at a time into mp4
     with imageio.get_writer(video_path, fps=1) as writer:
         for f in frame_files:
             frame = imageio.v3.imread(f"{frames_dir}/{f}")
             writer.append_data(frame)
 
-    # upload via File API
     with open(video_path, "rb") as f:
         video_file = client.files.upload(
             file=f,
@@ -402,11 +608,6 @@ async def analyze_interview(interview_id: str, applicant_id: str):
         )
     os.remove(video_path)
 
-    print(f"video_file.uri: {video_file.uri}")
-    print(f"video_file.state: {video_file.state}")
-    print(f"video_file.name: {video_file.name}")
-
-    # wait for processing
     while video_file.state.name == "PROCESSING":
         await asyncio.sleep(5)
         video_file = client.files.get(name=video_file.name)
@@ -415,47 +616,45 @@ async def analyze_interview(interview_id: str, applicant_id: str):
         print(f"Video processing failed for {interview_id}")
         return
 
-    # retry loop
-    max_retries = 5
-    for attempt in range(max_retries):
-        try:
-            response = await client.aio.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=[
-                    types.Part(file_data=types.FileData(
-                        file_uri=video_file.uri,
-                        mime_type="video/mp4"
-                    )),
-                    types.Part(text="""Analyze this interview recording for proctoring violations.
-Look for: candidate looking away frequently, another person visible, phone usage, reading from notes, candidate leaving frame.
-Respond as JSON only: {"alerts": [{"timestamp_seconds": int, "reason": str}], "summary": str}""")
-                ]
-            )
-            break
-        except Exception as e:
-            if "429" in str(e):
-                match = re.search(r"retryDelay.*?(\d+)s", str(e))
-                wait = int(match.group(1)) + 2 if match else 60
-                print(f"Rate limited, retrying in {wait}s (attempt {attempt + 1})")
-                await asyncio.sleep(wait)
-            else:
-                print(f"analyze frame error: {e}")
-                return
-    else:
-        print(f"Max retries exceeded for {interview_id}")
+    model = "gemini-2.5-flash"  # removed trailing comma — was a tuple before
+
+    cache = client.caches.create(
+        model=model,
+        config=types.CreateCachedContentConfig(
+            display_name=f"{interview_id}_proctoring",
+            system_instruction="Analyze interview recordings for proctoring violations. Return JSON only.",
+            contents=[video_file],
+            ttl="300s"  
+        )
+    )
+
+    try:
+        response = await client.aio.models.generate_content(
+            model=model,
+            config=types.GenerateContentConfig(cached_content=cache.name),
+            contents=[types.Part(text=(
+                "Detect proctoring violations. "
+                "JSON only: {\"alerts\": [{\"timestamp_seconds\": int, \"reason\": str}], \"cheating_detected\": bool}"
+            ))]
+        )
+    except Exception as e:
+        print(f"analyze error: {e}")
+        client.caches.delete(name=cache.name)
+        client.files.delete(name=video_file.name)
+        shutil.rmtree(frames_dir, ignore_errors=True)
         return
-    
-    if not response.text:
-       print(f"Empty response for {interview_id}, candidates: {response.candidates}")
-       return
-    print(response.text)
-    result = json.loads(re.sub(r"```json|```", "", response.text).strip())
-    print(result)
 
-
+    client.caches.delete(name=cache.name)
     client.files.delete(name=video_file.name)
     shutil.rmtree(frames_dir, ignore_errors=True)
-    print(f"Analysis done for {interview_id}")
+
+    if not response.text:
+        print(f"Empty response for {interview_id}")
+        return
+
+    result = json.loads(re.sub(r"```json|```", "", response.text).strip())
+    print(f"Analysis done for {interview_id}: {result}")
+    return result
 
 
 
