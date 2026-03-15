@@ -1,4 +1,4 @@
-
+#api
 
 import sys
 import os
@@ -18,6 +18,7 @@ from google.genai import types
 from google.genai.types import Content, Part,  FunctionCallingConfig, Modality
 from google.adk.agents.llm_agent import Agent
 from google.adk.apps.app import App
+from google.adk.tools import FunctionTool
 from google.adk.apps.app import EventsCompactionConfig
 from fastapi import FastAPI, Depends, UploadFile, File, WebSocket, HTTPException, Form, Response, Request
 from fastapi.websockets import WebSocketDisconnect
@@ -28,20 +29,20 @@ from typing import Optional
 
 from database.process import create_UserDB,create_InterviewDB, create_organizationDB, jobRequirements, convert_requirements_tostr
 from database.process import get_interview_questions, create_ApplicantDB, get_applicant_questions, get_interview_timer, fetch_applicantId_interview
-from database.process import fetch_interview, fetch_applicant
+from database.process import fetch_interview, fetch_applicant, fetch_details_organization, record_score, record_proctoring_report
+from database.process import start_interview_for_applicant, fetch_all_candidates_organization, fetch_candidate_detail, toggle_interview_status, fetch_prep_interviews, fetch_interview_report
+from database.process import get_applicant_start_session, close_session_applicant
 from database.db import sessionLocal
-from database.models import  Organization, User, InterviewType
+from database.models import  Organization, User, InterviewType, Interview
 
-from interview_agent.agent import question_agent, resume_agent
+from interview_agent.agent import question_agent, resume_agent, evaluator_agent
 from google.adk.agents.context_cache_config import ContextCacheConfig
 from datetime import datetime
 from google import genai
 import base64
 
 client = genai.Client(
-    vertexai=True,
-    project=os.environ["GOOGLE_CLOUD_PROJECT"],
-    location=os.environ["GOOGLE_CLOUD_LOCATION"]
+   api_key=os.environ["GOOGLE_API_KEY"]
 )
 
 
@@ -75,6 +76,7 @@ class InterviewRequest(BaseModel):
     end_date: datetime
     duration: int
     organization_id: Optional[str] = None
+    user_id: Optional[str] = None
 
     @field_validator('duration')
     @classmethod
@@ -102,7 +104,8 @@ class ApplicantRequest(BaseModel):
 app =FastAPI()
 session_service = InMemorySessionService()
 
-
+active_sessions = set()
+active_vision_sessions = set()
 
 
 async def create_interview_base_questions(message: str, duration: int):
@@ -111,9 +114,7 @@ async def create_interview_base_questions(message: str, duration: int):
        With this interview duration: {duration} minutes.
          Generate questions using job_requirements: {message}
     """
-    print("creating base questions")
     session = await session_service.create_session(app_name="interview", user_id="create_base_question")
-    print(f"session: {session}")
     for event in runner.run(
         user_id="create_base_question",
         session_id=session.id,
@@ -124,7 +125,6 @@ async def create_interview_base_questions(message: str, duration: int):
         )
 
     ):
-        print(f"4. event: {event}")
         if event.is_final_response():
             return event.content.parts[0].text
 
@@ -153,7 +153,7 @@ async def create_interview_full_questions(message: str, duration: int):
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],  
+    allow_origins=["http://localhost:5174"],  
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -202,8 +202,18 @@ async def get_user_applicant(user_id: str):
    except Exception as e:
       print(e)
       raise HTTPException(status_code=500, detail=str(e))
+   
 
-@app.post("/User/login/")
+@app.get("/User/{user_id}/prep/interviews")
+async def get_prep_interviews(user_id: str):
+    try:
+        results = fetch_prep_interviews(user_id)
+        return results
+    except Exception as e:
+        print(e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/User/login")
 async def login_user(request: UserLoginRequest, response: Response):
     db = sessionLocal()
     try:
@@ -235,6 +245,23 @@ async def login_user(request: UserLoginRequest, response: Response):
         db.close()
 
 
+@app.get("/User/report/{interview_id}")
+async def get_interview_report(interview_id: str, request: Request):
+    try:
+        # get user_id from session/cookie same way your other user endpoints do
+        user_id = request.cookies.get("user_id")
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Not authenticated")
+        result = fetch_interview_report(interview_id, user_id)
+        if not result:
+            raise HTTPException(status_code=404, detail="Report not found")
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(e)
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/User/me")
 async def get_me(request: Request):
     user_id = request.cookies.get("user_id")
@@ -252,6 +279,23 @@ async def get_me(request: Request):
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         db.close()
+
+
+@app.get("/Organization")
+async def get_username(request: Request):
+   db= sessionLocal()
+   try:
+       org_id = request.cookies.get("org_id")
+       if not org_id:
+          raise HTTPException(status_code=401, detail="Not authenticated")
+       org = db.query(Organization).filter(Organization.id == org_id).first()
+       return {"name": org.name}
+   except Exception as e:
+       print(e)
+       raise HTTPException(status_code=500,detail=str(e))
+   finally:
+       db.close()
+
 
 @app.get("/Organization/me")
 async def get_org_me(request: Request):
@@ -287,6 +331,51 @@ async def create_organization(request: OrganizationRequest, response: Response):
   except Exception as e:
       print(e)
       raise HTTPException(status_code=500, detail=str(e))
+  
+
+@app.get("/Organization/interview/candidate/report/{org_id}")
+async def get_interview_details(org_id: str):
+    try:
+         response  = fetch_details_organization(org_id)
+         return response
+    except Exception as e:
+        print(e)
+        raise HTTPException(status_code=500, detail=str(e))
+    
+@app.get("/Organization/candidates/{org_id}")
+async def get_all_candidates(org_id: str):
+    try:
+        response = fetch_all_candidates_organization(org_id)
+        return response
+    except Exception as e:
+        print(e)
+        raise HTTPException(status_code=500, detail=str(e))
+    
+@app.get("/Organization/candidates/detail/{applicant_id}")
+async def get_candidate_detail(applicant_id: str):
+    try:
+        result = fetch_candidate_detail(applicant_id)
+        if not result:
+            raise HTTPException(status_code=404, detail="Candidate not found")
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(e)
+        raise HTTPException(status_code=500, detail=str(e))
+    
+@app.patch("/Organization/interview/{interview_id}/status")
+async def toggle_interview_status_route(interview_id: str, action: str):
+    try:
+        result = toggle_interview_status(interview_id, action)
+        if not result:
+            raise HTTPException(status_code=404, detail="Interview not found")
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(e)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/Organization/login")
@@ -330,6 +419,8 @@ async def create_interview(request: InterviewRequest):
         )
         print(f"3. base questions: {base_question}")
         
+        #This is a hard-coded duration because of api limits  for free-tier and session_resumption issue, will upgrade later
+        request.duration = 10
       
         if request.organization_id is not None:
             interview_type = InterviewType.organization
@@ -375,6 +466,9 @@ async def create_interview(request: InterviewRequest):
     except Exception as e:
         print(f"Error creating interview: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+    
+
+
 
 @app.get("/Interview/{interview_id}")
 async def get_interview(interview_id: str):
@@ -384,6 +478,33 @@ async def get_interview(interview_id: str):
    except Exception as e:
       print(e)
       raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/Interview/full/{interview_id}")
+async def get_interview_public(interview_id: str):
+    try:
+        db = sessionLocal()
+        interview = db.query(Interview).filter(Interview.id == interview_id).first()
+        if not interview:
+            raise HTTPException(status_code=404, detail="Interview not found")
+        return {
+            "role": interview.role,
+            "type": interview.type,
+            "description": interview.description,
+            "start_date": interview.start_date.isoformat(),
+            "end_date": interview.end_date.isoformat(),
+            "duration": interview.duration,
+            "job_requirements": interview.job_requirements,
+            "status": interview.status,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+
+
    
 @app.get("/Applicant/{applicant_id}")
 async def get_applicant(applicant_id: str):
@@ -417,19 +538,127 @@ async def sign_up_for_interview(request: Request, interview_id: str, applicant: 
      print(e)
      raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/Prepper/create/{interview_id}/{applicant_id}")
+async def create_prepper(
+    interview_id: str, 
+    applicant_id: str,
+    name: str = Form(...),
+    request: str = Form(...),
+    file: UploadFile = File(...)
+):
+    try:
+        interview_request = InterviewRequest(**json.loads(request))
+
+        # --- Create Interview ---
+        stringJobRequirements = convert_requirements_tostr(interview_request.job_requirements)
+        base_questions = await create_interview_base_questions(stringJobRequirements, interview_request.duration)
+
+        interview_request.duration = 10  # hard-coded due to api limits
+
+        if interview_request.organization_id is not None:
+            interview_type = InterviewType.organization
+            new_interview = create_InterviewDB(
+                interview_request.role,
+                interview_type,
+                interview_request.description,
+                interview_request.job_requirements,
+                interview_request.start_date,
+                interview_request.end_date,
+                interview_request.duration,
+                base_questions,
+                organization_id=interview_request.organization_id,
+                user_id=None
+            )
+        else:
+            interview_type = InterviewType.user
+            new_interview = create_InterviewDB(
+                interview_request.role,
+                interview_type,
+                interview_request.description,
+                interview_request.job_requirements,
+                interview_request.start_date,
+                interview_request.end_date,
+                interview_request.duration,
+                base_questions,
+                organization_id=None,
+                user_id=applicant_id
+            )
+
+        # --- Create Applicant ---
+        pdf_bytes = await file.read()
+        doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+        resume = " ".join(page.get_text() for page in doc)
+
+        domain_questions = await create_interview_full_questions(resume, interview_request.duration)
+        full_questions = domain_questions + base_questions
+
+        create_ApplicantDB(name, pdf_bytes, full_questions, new_interview.id, applicant_id)
+
+        return {
+            "status": "ok",
+            "interview_id": new_interview.id,
+            "applicant_id": applicant_id,
+            "type": interview_type.value
+        }
+    except ValidationError as e:
+        print(f"Validation error: {e}")
+        raise HTTPException(status_code=422, detail=e.errors())
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(e)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 
 
-async def run_interview(websocket, applicant_id, interview_app):
+async def evaluate_responses(message: str):
+    runner = Runner(agent=evaluator_agent, app_name="evaluator_agent", session_service=session_service)
+    prompt = f"""
+      this are the interview questions and responses to the questions: {message}. evaluate interview
+    """
+    session = await session_service.create_session(app_name="evaluator_agent", user_id="evaluate_response")
+    for event in runner.run(
+        user_id="evaluate_response",
+        session_id=session.id,
+        new_message=Content(parts=[Part(text=prompt)]),
+        run_config=RunConfig(
+            streaming_mode= StreamingMode.NONE,
+            max_llm_calls=3
+        )
+
+    ):
+        if event.is_final_response():
+            raw = event.content.parts[0].text
+            return json.loads(raw)["score"]  
+
+
+def convert_transcript_to_text(transcription_log: list) -> str:
+    lines = []
+    for entry in transcription_log:
+        role = entry.get("role")  
+        text = entry.get("text") 
+        
+        if role == "candidate":
+            lines.append(f"Candidate: {text}")
+        elif role == "agent":
+            lines.append(f"Interviewer: {text}")
+    
+    return "\n".join(lines)
+
+
+async def run_interview(websocket, applicant_id, interview_id, interview_app):
     runner = InMemoryRunner(app=interview_app)
 
     session = await runner.session_service.create_session(
-        app_name="interview_live", user_id=applicant_id
+        app_name="interview_app", user_id=applicant_id
     )
   
     transcript_log = []
     live_request_queue = LiveRequestQueue()
+    resumption_handle = None
+
+    start_interview_for_applicant(applicant_id)
 
     async def receive_audio():
         try:
@@ -447,28 +676,26 @@ async def run_interview(websocket, applicant_id, interview_app):
             live_request_queue.close()
 
     async def send_audio():
-       
-        print("send_audio started")
+        nonlocal resumption_handle
+
         await websocket.send_text(json.dumps({"mime_type": "audio/pcm"}))
 
-
-        print("sent mime_type header")
         live_request_queue.send_content(
             types.Content(parts=[types.Part(text="Begin the interview.")], role="user")
         )
-        print("sent begin interview content")
-        run_config = RunConfig(
-           streaming_mode=StreamingMode.BIDI,
-           response_modalities=[Modality.AUDIO],
-           max_llm_calls=500,
-           session_resumption=types.SessionResumptionConfig(
-               transparent=True
-           ), 
-           context_window_compression= types.ContextWindowCompressionConfig(
-              trigger_tokens=50000,
-               sliding_window=types.SlidingWindow( target_tokens=25000 ),
-             )
 
+        run_config = RunConfig(
+            streaming_mode=StreamingMode.BIDI,
+            response_modalities=[Modality.AUDIO],
+            max_llm_calls=500,
+            save_live_blob=True,
+            session_resumption=types.SessionResumptionConfig(
+                handle=resumption_handle
+            ),
+            context_window_compression=types.ContextWindowCompressionConfig(
+                trigger_tokens=50000,
+                sliding_window=types.SlidingWindow(target_tokens=20000),
+            )
         )
 
         try:
@@ -476,207 +703,296 @@ async def run_interview(websocket, applicant_id, interview_app):
                 session=session,
                 live_request_queue=live_request_queue,
                 run_config=run_config
-                ):
+            ):
 
-                    if event.input_transcription and event.input_transcription.finished:
-                        transcript_log.append({
-                            "role": "candidate",
-                            "text": event.input_transcription.text,
-                            "timestamp": datetime.now().isoformat()
-                        })
 
-                    if event.output_transcription and event.output_transcription.finished:
-                        transcript_log.append({
-                            "role": "agent",
-                            "text": event.output_transcription.text,
-                            "timestamp": datetime.now().isoformat()
-                        })
+                # save resumption handle
+                if event.live_session_resumption_update:
+                    update = event.live_session_resumption_update
+                    if update.resumable and update.new_handle:
+                        resumption_handle = update.new_handle
 
-                    part = (event.content and event.content.parts and event.content.parts[0])
-                    if part:
-                        is_audio = part.inline_data and part.inline_data.mime_type.startswith("audio/pcm")
-                        if is_audio and part.inline_data.data:
-                            await websocket.send_bytes(part.inline_data.data)
+                # transcription
+                if event.input_transcription and event.input_transcription.finished:
+                    message = {
+                        "role": "candidate",
+                        "text": event.input_transcription.text,
+                        "timestamp": datetime.now().isoformat()
+                    }
+                    transcript_log.append(message)
+                    print(message)
+                    await websocket.send_text(json.dumps(message))
 
-                    if event.turn_complete or event.interrupted:
-                        await websocket.send_text(json.dumps({
-                            "turn_complete": event.turn_complete,
-                            "interrupted": event.interrupted,
-                        }))
+                if event.output_transcription and event.output_transcription.finished:
+                    message = {
+                        "role": "agent",
+                        "text": event.output_transcription.text,
+                        "timestamp": datetime.now().isoformat()
+                    }
+                    transcript_log.append(message)
+                    print(message)
+                    await websocket.send_text(json.dumps(message))
 
-        except WebSocketDisconnect: 
-              pass
+                # send audio to client
+                part = (event.content and event.content.parts and event.content.parts[0])
+                if part:
+                    is_audio = part.inline_data and part.inline_data.mime_type.startswith("audio/pcm")
+                    if is_audio and part.inline_data.data:
+                        await websocket.send_bytes(part.inline_data.data)
 
+                # turn complete
+                if event.turn_complete or event.interrupted:
+                    await websocket.send_text(json.dumps({
+                        "turn_complete": event.turn_complete,
+                        "interrupted": event.interrupted,
+                    }))
+
+        except WebSocketDisconnect:
+            pass
         except Exception as e:
-           import traceback
-           print(f"send_audio error: {e}")
-           traceback.print_exc()
+            import traceback
+            print(f"send_audio error: {e}")
+            traceback.print_exc()
+        finally:
+            try:
+                print("evaluating response")
+                transcription = convert_transcript_to_text(transcript_log)
+                score = await evaluate_responses(transcription)
+                record_score(interview_id, applicant_id, score)
+            except Exception as e:
+                print(e)
 
-                  
 
     await asyncio.gather(receive_audio(), send_audio(), return_exceptions=True)
 
 
-@app.get("/check_models")
-async def check_models():
-    models = []
-    for model in client.models.list():
-        models.append(model.name)
-    return {"models": models}
-
-
-
-
-
-
 @app.websocket("/interview/start/{interview_id}/{applicant_id}")
 async def audio_interview(websocket: WebSocket, interview_id: str, applicant_id: str):
-  await websocket.accept()
+    await websocket.accept()
 
-  start_time, end_time, duration = get_interview_timer(interview_id)
+    start_time, end_time, duration, status = get_interview_timer(interview_id)
+    started_session = get_applicant_start_session(applicant_id)
 
-  if(datetime.now() < start_time):
-      await websocket.close(code=1008, reason="Interview has not started")
-      return
-  
-  if (datetime.now() > end_time):
-     await websocket.close(code=1008, reason="Interview has not started")
-     return
-  
-  questions = get_applicant_questions(applicant_id)
-  interview_agent = Agent(
-    name="interview_live",
-    model="gemini-live-2.5-flash-native-audio",
-    instruction=f"""
+    if datetime.now() < start_time:
+        await websocket.close(code=1008, reason="Interview has not started")
+        return
+
+    if datetime.now() > end_time:
+        await websocket.close(code=1008, reason="Interview has ended")
+        return
+    
+    if status != "active":
+        await websocket.close(code=1008, reason="Interview status is closed")
+        return
+    
+    if started_session:
+        await websocket.close(code=1008, reason="you have started a meeting session before")
+
+    if applicant_id in active_sessions:
+        await websocket.close(code=1008, reason="Session already active")
+        return
+
+
+
+    questions = get_applicant_questions(applicant_id)
+    questions = questions.strip()
+    question_list = [q.strip() for q in questions.split("\n") if q.strip()][:50]
+    formatted = "\n".join(f"{i+1}. {q}" for i, q in enumerate(question_list))
+
+
+
+
+    interview_agent = Agent(
+       name="interview_live",
+       model="gemini-2.5-flash-native-audio-latest",
+       instruction=f"""
         You are a professional Software Engineering interview agent.
-        Do NOT output any reasoning, thoughts, or internal monologue.
+        Do NOT output reasoning or internal monologue.
         Respond only with direct spoken answers.
         Ask one question at a time and wait for a response before continuing.
-        Start with 2 resume-based questions, then proceed through remaining sections.
-        When all questions are done say "The interview is now complete."
-        Questions: {questions}.
-        Do NOT answer the users questions.
-        DO NOT ASK the same question twice
-        Begin by greeting the candidate and asking the first resume-based question.
-    """,
+        Start with a greeting then ask question 1.
+        Always wait for user to respond before asking the next question, if they haven't responded for a long time. 
+        say "i'm still waiting"
+        Do NOT answer the user's questions.
+        DO NOT ASK the same question twice.
+        When ALL questions are asked from each section say "The interview is now complete."
+        Questions:
+        {formatted}
+      """,
     )
-  
-  interview_app = App(
-       name="interview_app",
-       root_agent=interview_agent,
-       events_compaction_config= EventsCompactionConfig(
-         compaction_interval=10,
-         overlap_size=5
-      ),
-      context_cache_config=ContextCacheConfig(
-        min_tokens=2048,    
-        ttl_seconds=600,    
-        cache_intervals=5, 
-      ),
+
+    interview_app = App(
+        name="interview_app",
+        root_agent=interview_agent,
+        context_cache_config=ContextCacheConfig(
+            min_tokens=2048,
+            ttl_seconds=600,
+            cache_intervals=5,
+        ),
     )
-  try:
-     await asyncio.wait_for(run_interview(websocket,applicant_id, interview_app), timeout=duration*60)
-  except asyncio.TimeoutError:
-     await websocket.send_text(json.dumps({"ended": True, "reason": "time_limit_reached"}))
-     await websocket.close()
 
-
+    active_sessions.add(applicant_id)
+    try:
+        await asyncio.wait_for(
+            run_interview(websocket, applicant_id, interview_id, interview_app),
+            timeout=duration * 60
+        )
+    except asyncio.TimeoutError:
+        await websocket.send_text(json.dumps({"ended": True, "reason": "time_limit_reached"}))
+        await websocket.close()
+    finally:
+        active_sessions.discard(applicant_id)
+        close_session_applicant(applicant_id)
 
 async def analyze_interview(interview_id: str, applicant_id: str):
+    print("converting to path")
     frames_dir = f"/tmp/{interview_id}_{applicant_id}_frames"
     if not os.path.exists(frames_dir):
         print(f"No frames found for {interview_id}")
         return
 
+    print("sorting files")
     frame_files = sorted(os.listdir(frames_dir))
     if not frame_files:
         print(f"Empty frames dir for {interview_id}")
         return
 
-    import imageio
-    video_path = f"/tmp/{interview_id}_{applicant_id}.mp4"
+    print("uploading frames directly")
+    step = max(1, len(frame_files) // 20)  # max 20 frames
+    sampled = frame_files[::step][:20]
 
-    with imageio.get_writer(video_path, fps=1) as writer:
-        for f in frame_files:
-            frame = imageio.v3.imread(f"{frames_dir}/{f}")
-            writer.append_data(frame)
+    contents = []
+    for f in sampled:
+        with open(f"{frames_dir}/{f}", "rb") as img:
+            contents.append(types.Part.from_bytes(
+                data=img.read(),
+                mime_type="image/jpeg"
+            ))
+    print(f"prepared {len(contents)} frames")
 
-    with open(video_path, "rb") as f:
-        video_file = client.files.upload(
-            file=f,
-            config={"mime_type": "video/mp4", "display_name": f"{interview_id}_proctoring"}
-        )
-    os.remove(video_path)
+    contents.append(types.Part(text=(
+        "Detect proctoring violations. "
+        "JSON only: {\"alerts\": [{\"frame\": int, \"reason\": str}], \"cheating_detected\": bool}"
+    )))
 
-    while video_file.state.name == "PROCESSING":
-        await asyncio.sleep(5)
-        video_file = client.files.get(name=video_file.name)
+    model = "gemini-2.5-flash"
+    cache = None
 
-    if video_file.state.name == "FAILED":
-        print(f"Video processing failed for {interview_id}")
-        return
-
-    model = "gemini-2.5-flash"  # removed trailing comma — was a tuple before
-
-    cache = client.caches.create(
+    print("checking token count")
+    token_response = await client.aio.models.count_tokens(
         model=model,
-        config=types.CreateCachedContentConfig(
-            display_name=f"{interview_id}_proctoring",
-            system_instruction="Analyze interview recordings for proctoring violations. Return JSON only.",
-            contents=[video_file],
-            ttl="300s"  
-        )
+        contents=contents
     )
+    print(f"token count: {token_response.total_tokens}")
 
+    if token_response.total_tokens >= 32768:
+        print("creating cache")
+        cache = client.caches.create(
+            model=model,
+            config=types.CreateCachedContentConfig(
+                display_name=f"{interview_id}_proctoring",
+                system_instruction="""
+               You are analyzing video frames from a live oral interview for proctoring violations.
+               Each frame represents one second of footage.
+
+               NORMAL BEHAVIOR — do NOT flag these under any circumstances:
+                - Brief glances away from camera while thinking or recalling
+                - Natural head movements, blinking, shifting posture
+                - Speaking, pausing, or thinking aloud
+                - Occasional eye movement in any direction
+                - Minor lighting changes or camera angle shifts
+                - Looking down, up, or sideways for a few seconds
+
+            FLAG AS A VIOLATION only when ALL of the following are true:
+             - The behavior is sustained for at least 40 consecutive seconds
+             - The behavior is unambiguous and clearly visible across multiple frames
+             - The behavior cannot be explained by normal thinking or speaking
+
+           VIOLATIONS (only when meeting the above threshold):
+           - Eyes clearly fixed on an off-screen source for 20+ seconds
+           - A second person visibly present and appearing to assist
+           - Candidate visibly reading from notes, phone, or screen for 20+ seconds
+           - Audible coaching voice from off-camera
+           - Candidate leaving the frame entirely for 20+ seconds
+
+          STRICT RULE: If you are not completely certain, set cheating_detected to false.
+          A single frame, brief movement, or ambiguous behavior is NEVER sufficient evidence.
+          Most interviews will have cheating_detected: false — this is expected and correct.
+
+         Return JSON only: {"alerts": [{"frame": int, "reason": str}], "cheating_detected": bool}.""",
+                contents=contents,
+                ttl="300s"
+            )
+        )
+        print(f"cache created: {cache.name}")
+        generate_config = types.GenerateContentConfig(cached_content=cache.name)
+        generate_contents = [types.Part(text=(
+            "Detect proctoring violations. "
+            "JSON only: {\"alerts\": [{\"frame\": int, \"reason\": str}], \"cheating_detected\": bool}"
+        ))]
+    else:
+        print("token count too low for caching, sending directly")
+        generate_config = None
+        generate_contents = contents
+
+    print("calling generate_content")
     try:
         response = await client.aio.models.generate_content(
             model=model,
-            config=types.GenerateContentConfig(cached_content=cache.name),
-            contents=[types.Part(text=(
-                "Detect proctoring violations. "
-                "JSON only: {\"alerts\": [{\"timestamp_seconds\": int, \"reason\": str}], \"cheating_detected\": bool}"
-            ))]
+            config=generate_config,
+            contents=generate_contents
         )
     except Exception as e:
         print(f"analyze error: {e}")
-        client.caches.delete(name=cache.name)
-        client.files.delete(name=video_file.name)
-        shutil.rmtree(frames_dir, ignore_errors=True)
         return
+    finally:
+        if cache:
+            try:
+                client.caches.delete(name=cache.name)
+            except Exception:
+                pass
+        shutil.rmtree(frames_dir, ignore_errors=True)
 
-    client.caches.delete(name=cache.name)
-    client.files.delete(name=video_file.name)
-    shutil.rmtree(frames_dir, ignore_errors=True)
-
+    print("got response")
     if not response.text:
         print(f"Empty response for {interview_id}")
         return
 
     result = json.loads(re.sub(r"```json|```", "", response.text).strip())
+    result = json.loads(re.sub(r"```json|```", "", response.text).strip())
+
+
+
     print(f"Analysis done for {interview_id}: {result}")
+    proctoring_report = result["alerts"]
+    cheating_detected = result["cheating_detected"]
+
+    record_proctoring_report(interview_id, applicant_id, proctoring_report, cheating_detected)
     return result
 
-
-
+ 
+ 
 async def analysis_worker():
     while True:
         job = await analysis_queue.get()
-        await analyze_interview(job["interview_id"], job["applicant_id"])
-        analysis_queue.task_done()
-
+        try:
+            await analyze_interview(job["interview_id"], job["applicant_id"])
+        except Exception as e:
+            print(f"analysis_worker error: {e}")
+        finally:
+            analysis_queue.task_done()
+ 
+ 
 @app.on_event("startup")
 async def startup():
     asyncio.create_task(analysis_worker())
-
-
-
-
-
+ 
+ 
 async def run_visual_interview(websocket: WebSocket, interview_id: str, applicant_id: str):
     frames_dir = f"/tmp/{interview_id}_{applicant_id}_frames"
     os.makedirs(frames_dir, exist_ok=True)
     frame_count = 0
-
+ 
     try:
         while True:
             message = await websocket.receive_text()
@@ -698,26 +1014,44 @@ async def run_visual_interview(websocket: WebSocket, interview_id: str, applican
                 "applicant_id": applicant_id
             })
             print(f"Queued analysis for {interview_id}, {frame_count} frames")
-
+ 
+ 
 @app.websocket("/interview/visual_interview/start/{interview_id}/{applicant_id}")
 async def visual_interview(websocket: WebSocket, interview_id: str, applicant_id: str):
     await websocket.accept()
-    start_time, end_time, duration = get_interview_timer(interview_id)
+
+    start_time, end_time, duration, status = get_interview_timer(interview_id)
+ 
+    if datetime.now() < start_time:
+        await websocket.close(code=1008, reason="Interview has not started")
+        return
+ 
+    if datetime.now() > end_time:
+        await websocket.close(code=1008, reason="Interview has ended")
+        return
+    if status != "active":
+        await websocket.close(code=1008, reason="Interview status is closed" )
+        return
     
-    if(datetime.now() < start_time):
-       await websocket.close(code=1008, reason="Interview has not started")
-       return
-  
-    if (datetime.now() > end_time):
-       await websocket.close(code=1008, reason="Interview has not started")
-       return
+    if applicant_id in active_vision_sessions:
+        await websocket.close(code=1008, reason="Session already active")
+        return
     
+    active_vision_sessions.add(applicant_id)
     try:
-       await asyncio.wait_for(run_visual_interview(websocket, interview_id, applicant_id), timeout=duration*60)
+        await asyncio.wait_for(
+            run_visual_interview(websocket, interview_id, applicant_id),
+            timeout=duration * 60
+        )
     except asyncio.TimeoutError:
-       await websocket.send_text(json.dumps({"ended": True, "reason": "time_limit_reached"}))
-       await websocket.close()
-    
+        try:
+            await websocket.send_text(json.dumps({"ended": True, "reason": "time_limit_reached"}))
+            await websocket.close()
+        except RuntimeError:
+            pass
+    finally:
+       active_vision_sessions.discard(applicant_id)
+       close_session_applicant(applicant_id)
 
 
 

@@ -10,6 +10,7 @@ from google.genai.types import GenerateContentConfig, ToolConfig, FunctionCallin
 from google.adk.apps.app import App
 from google.adk.apps.app import EventsCompactionConfig
 from sentence_transformers import SentenceTransformer
+from pydantic import BaseModel
 from .Interview_information.vectorCollection import COLLECTION, client, get_encoder
 
 
@@ -129,3 +130,25 @@ resume_agent = Agent(
 )
 
 
+class ScoreOutput(BaseModel):
+    score: int
+
+
+evaluator_agent = Agent(
+    model= 'gemini-2.5-flash',
+    name= "evaluator_agent",
+    description= """
+      This is a evaulator agent for evaluating interview responses
+    """,
+    output_schema=ScoreOutput,
+    output_key="score_result",
+    instruction="""
+
+    You are an evaluator agent that evaluates tech interviews.
+    Given the questions asked and the candidate's responses, return a score from 0 to 100
+    based on accuracy and technical depth of the answers.
+
+    Note: responses may contain mistranslations due to audio transcription(help fix errors) — do not penalize for these.
+    Be fair: do not grade too harshly or too generously.
+    """
+)

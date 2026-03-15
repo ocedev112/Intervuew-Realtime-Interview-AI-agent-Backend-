@@ -61,17 +61,19 @@ class Interview(Base):
     _status = Column("status", String, default="active")
     @hybrid_property
     def status(self):
-        if datetime.utcnow() > self.end_date:
-            return "closed"
-        return "active"
-    
+      if self._status == "closed":
+        return "closed"
+      if datetime.utcnow() > self.end_date:
+        return "closed"
+      return "active"
+
     @status.expression
     def status(cls):
-        """Use in queries"""
-        return case(
-            (cls.end_date < func.now(), "expired"),
-            else_="active"
-        )
+      return case(
+        (cls._status == "closed", "closed"),
+        (cls.end_date < func.now(), "closed"),
+        else_="active"
+      )
 
 
 
