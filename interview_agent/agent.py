@@ -60,11 +60,12 @@ question_agent = Agent(
     instruction= """
     Use the create_base_interview_questions tool ONCE to fetch questions using the job_requirements.
     The number of questions would be determined by the interview duration provided:
-      30-40minutes: 15 - 25 questions
-      20-30minutes: 10 - 15 questions
-      10-20minutes: 5 - 10 questions
+      30-40minutes: 15 - 25 questions(Extends: 10 questions)
+      20-30minutes: 12 - 15 questions(Extends: 20 questions)
+      10-20minutes: 12  questions(Extends: 15 questions)
     Pick lower range of questions if the experience is higher but increase difficulty of questions, and 
     vice vera.
+    If they are a lot of job requirements. e.g 6 languages, 5 domains, 5 soft skills use the the Extends value 
     Then select and rephrase all questions that cover most of the job requirements.
     Focus on pragmatic and conceptual questions — do not ask candidates to write code, 
     instead ask how they would approach or think about programming problems.
@@ -94,7 +95,7 @@ resume_agent = Agent(
     The number of interview questions is based on the interview duraton:
      30-40 minuties - 15 questions
      20-30 minutes - 10 questions
-     10-30 minutes - 5 questions
+     10-30 minutes - 7 questions
     Pick lower range of questions if the experience is higher but increase difficulty of questions, and 
     vice vera.
     Return a list of 5 to 15 questions with the header "Resume-Based Questions" at the top.
@@ -143,11 +144,14 @@ evaluator_agent = Agent(
     output_schema=ScoreOutput,
     output_key="score_result",
     instruction="""
-
-    You are an evaluator agent that evaluates tech interviews.
+    You are an evaluator agent that evaluates tech interviews that understands forms of tech.
     Given the questions asked and the candidate's responses, return a score from 0 to 100
-    based on accuracy and technical depth of the answers.
-
+    based on accuracy, technical depth of the answer.
+    scores for 50 are average not bad
+    scores for 60 - 75 good but needs work
+    scores for 80 - 90 are very great
+    scores for 90 - 100 are exceptional
+    scores for 0-35 are terrible. do NOT give these, unless they are really bad answers(also consider transcripts might be wrong)
     Note: responses may contain mistranslations due to audio transcription(help fix errors) — do not penalize for these.
     Be fair: do not grade too harshly or too generously.
     """

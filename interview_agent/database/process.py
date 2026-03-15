@@ -314,6 +314,7 @@ def fetch_interview(interview_id: str):
 def fetch_applicant(applicant_id: str):
     db = sessionLocal()
     try:
+     
         data = db.query(Applicant).filter(Applicant.id == applicant_id).first()
         if not data:
             return None
@@ -411,6 +412,20 @@ def open_interview(interview_id: str):
         db.close()
 
 
+def validate_interview(interview_id: str, applicant_id: str):
+  db = sessionLocal()
+  try:
+        applicant = db.query(Applicant).filter(Applicant.id == applicant_id).first()
+        if applicant is None:
+             return False
+        
+        elif applicant.interview_id != interview_id:
+            return False
+        return True
+  finally: 
+      db.close()
+
+
 
 def create_organizationDB(name: str, email: str, password: str) -> Organization:
     db = sessionLocal()
@@ -473,6 +488,7 @@ def get_applicant_start_session(applicant_id: str):
     db = sessionLocal()
     try:
        applicant =  db.query(Applicant).filter(Applicant.id == applicant_id).first()
+       print("applicant", applicant)
        print("started_session", applicant.started_session)
        return applicant.started_session
     finally:
@@ -520,6 +536,7 @@ def create_ApplicantDB(name: str, resume: bytes, full_question: str, interview_i
       db.add(applicant)
       db.commit()
       db.refresh(applicant)
+      return applicant
    except Exception as e:
       db.rollback()
       raise
