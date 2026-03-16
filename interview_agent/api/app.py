@@ -685,6 +685,7 @@ async def run_interview(websocket, applicant_id, interview_id, interview_app, du
             )
         )
         print("warning sent")
+
     async def receive_audio():
         try:
             await websocket.receive_text()
@@ -708,100 +709,112 @@ async def run_interview(websocket, applicant_id, interview_id, interview_app, du
             types.Content(parts=[types.Part(text="Begin the interview.")], role="user")
         )
 
-        run_config = RunConfig(
-            streaming_mode=StreamingMode.BIDI,
-            response_modalities=[Modality.AUDIO],
-            max_llm_calls=500,
-            save_live_blob=True,
-            speech_config=types.SpeechConfig(
-                voice_config=types.VoiceConfig(
-                    prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Charon")
-                )
-            ),
-            realtime_input_config=types.RealtimeInputConfig(
-                automatic_activity_detection=types.AutomaticActivityDetection(
-                    disabled=False,
-                    start_of_speech_sensitivity=types.StartSensitivity.START_SENSITIVITY_UNSPECIFIED,
-                    end_of_speech_sensitivity=types.EndSensitivity.END_SENSITIVITY_LOW,
-                    prefix_padding_ms=200,
-                    silence_duration_ms=900,
+        while True:
+            run_config = RunConfig(
+                streaming_mode=StreamingMode.BIDI,
+                response_modalities=[Modality.AUDIO],
+                max_llm_calls=500,
+                save_live_blob=True,
+                speech_config=types.SpeechConfig(
+                    voice_config=types.VoiceConfig(
+                        prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Charon")
+                    )
                 ),
-            ),
-            session_resumption=types.SessionResumptionConfig(handle=resumption_handle),
-            context_window_compression=types.ContextWindowCompressionConfig(
-                trigger_tokens=50000,
-                sliding_window=types.SlidingWindow(target_tokens=20000),
-            ),
-            output_audio_transcription=types.AudioTranscriptionConfig(),
-            input_audio_transcription=types.AudioTranscriptionConfig(),
-        )
+                realtime_input_config=types.RealtimeInputConfig(
+                    automatic_activity_detection=types.AutomaticActivityDetection(
+                        disabled=False,
+                        start_of_speech_sensitivity=types.StartSensitivity.START_SENSITIVITY_HIGH,
+                        end_of_speech_sensitivity=types.EndSensitivity.END_SENSITIVITY_HIGH,
+                        prefix_padding_ms=200,
+                        silence_duration_ms=900,
+                    ),
+                ),
+                session_resumption=types.SessionResumptionConfig(handle=resumption_handle),
+                context_window_compression=types.ContextWindowCompressionConfig(
+                    trigger_tokens=4000,
+                    sliding_window=types.SlidingWindow(target_tokens=1024),
+                ),
+                output_audio_transcription=types.AudioTranscriptionConfig(),
+                input_audio_transcription=types.AudioTranscriptionConfig(),
+            )
 
-        now = datetime.now
+            now = datetime.now
 
-        async def _flush_message(role, text):
-            message = {"role": role, "text": text, "timestamp": now().isoformat()}
-            transcript_log.append(message)
-            print(message)
-            await websocket.send_text(json.dumps(message))
+            async def _flush_message(role, text):
+                message = {"role": role, "text": text, "timestamp": now().isoformat()}
+                transcript_log.append(message)
+                print(message)
+                await websocket.send_text(json.dumps(message))
+
+            try:
+                async for event in runner.run_live(
+                    session=session,
+                    live_request_queue=live_request_queue,
+                    run_config=run_config,
+                ):
+                    if event.live_session_resumption_update:
+                        update = event.live_session_resumption_update
+                        if update.resumable and update.new_handle:
+                            resumption_handle = update.new_handle
+                            print("Resumption handle saved")
+
+                    if event.input_transcription and event.input_transcription.finished:
+                        await _flush_message("candidate", event.input_transcription.text)
+
+                    if event.output_transcription and event.output_transcription.finished:
+                        await _flush_message("agent", event.output_transcription.text)
+
+                    parts = event.content and event.content.parts
+                    if parts:
+                        part = parts[0]
+                        if (
+                            part.inline_data
+                            and part.inline_data.mime_type.startswith("audio/pcm")
+                            and part.inline_data.data
+                        ):
+                            await websocket.send_bytes(part.inline_data.data)
+
+                    if event.turn_complete or event.interrupted:
+                        await websocket.send_text(
+                            json.dumps(
+                                {"turn_complete": event.turn_complete, "interrupted": event.interrupted}
+                            )
+                        )
+
+            except WebSocketDisconnect:
+                break
+            except Exception as e:
+                import traceback
+                print(f"send_audio error: {e}")
+                traceback.print_exc()
+                if resumption_handle:
+                    print("Attempting reconnect with resumption handle...")
+                    await asyncio.sleep(1)
+                    continue
+                else:
+                    print("No resumption handle, cannot reconnect")
+                    break
+            else:
+                break
 
         try:
-            async for event in runner.run_live(
-                session=session,
-                live_request_queue=live_request_queue,
-                run_config=run_config,
-            ):
-                if event.live_session_resumption_update:
-                    update = event.live_session_resumption_update
-                    if update.resumable and update.new_handle:
-                        resumption_handle = update.new_handle
-
-                if event.input_transcription and event.input_transcription.finished:
-                    await _flush_message("candidate", event.input_transcription.text)
-
-                if event.output_transcription and event.output_transcription.finished:
-                    await _flush_message("agent", event.output_transcription.text)
-
-                parts = event.content and event.content.parts
-                if parts:
-                    part = parts[0]
-                    if (
-                        part.inline_data
-                        and part.inline_data.mime_type.startswith("audio/pcm")
-                        and part.inline_data.data
-                    ):
-                        await websocket.send_bytes(part.inline_data.data)
-
-                if event.turn_complete or event.interrupted:
-                    await websocket.send_text(
-                        json.dumps(
-                            {"turn_complete": event.turn_complete, "interrupted": event.interrupted}
-                        )
-                    )
-
-        except WebSocketDisconnect:
-            pass
-        except Exception as e:
-            import traceback
-            print(f"send_audio error: {e}")
-            traceback.print_exc()
-        finally:
-          try:
             print("evaluating response")
             for attempt in range(4):
-             try:
-                score = await evaluate_responses(convert_transcript_to_text(transcript_log))
-                record_score(interview_id, applicant_id, score)
-                break
-             except Exception as e:
-                if attempt < 3:
-                    print(f"Evaluation attempt {attempt + 1} failed: {e}, retrying in {2 ** attempt}s...")
-                    await asyncio.sleep(2 ** attempt)
-                else:
-                    print(f"Evaluation failed after 4 attempts: {e}")
-          except Exception as e:
-                     print(e)
+                try:
+                    score = await evaluate_responses(convert_transcript_to_text(transcript_log))
+                    record_score(interview_id, applicant_id, score)
+                    break
+                except Exception as e:
+                    if attempt < 3:
+                        print(f"Evaluation attempt {attempt + 1} failed: {e}, retrying in {2 ** attempt}s...")
+                        await asyncio.sleep(2 ** attempt)
+                    else:
+                        print(f"Evaluation failed after 4 attempts: {e}")
+        except Exception as e:
+            print(e)
 
     await asyncio.gather(send_warning(), receive_audio(), send_audio(), return_exceptions=True)
+
 
 
 @app.websocket("/interview/start/{interview_id}/{applicant_id}")
@@ -851,21 +864,26 @@ async def audio_interview(websocket: WebSocket, interview_id: str, applicant_id:
        name="interview_live",
        model="gemini-2.5-flash-native-audio-latest",
        instruction=f"""
-        You are a professional Software Engineering interview agent.
-        Do NOT output reasoning or internal monologue.
-        Respond only with direct spoken answers.
-        Ask one question at a time and wait for a response before continuing.
-        Start with a greeting then ask question 1.
-        Always wait for user to respond before asking the next question, if they haven't responded for a long time. 
-        say "i'm still waiting"
-        Do NOT answer the user's questions.
-        DO NOT interrupt user while they are giving the answer.(IMPORTANT)
-        If the user's answer is vague, incomplete or missing, ask a new question for more details, or elaborate.
-        Ask follow-up questions but not too many, for the user to elaborate more
-        DO NOT focus on one section but switch sections intelligently, such that they flow.
-        DO NOT respond to noise.
-        DO NOT ASK the same question twice.
-        When ALL questions are asked from each section say "The interview is now complete."
+      You are a professional Software Engineering interview agent.
+
+    RESPONSE RULES:
+      - Respond only with direct spoken words, no internal reasoning or monologue.
+     - Ask one question at a time and wait for a response before continuing.
+    - Do not answer the user's questions.
+-      Do not ask the same question twice.
+
+    QUESTION FLOW:
+     - Start with a brief greeting, then ask the first question.
+    - After each answer, decide whether to ask a follow-up for elaboration or move to the next section.
+    - Switch between sections naturally so the interview flows as a conversation.
+      - If an answer is vague or incomplete, ask one follow-up question before moving on.
+
+    WAITING:
+     - If the user has not responded for an unusually long time, say exactly: "I'm still waiting."
+
+   ENDING THE INTERVIEW:
+     - When all sections are complete and you receive message of 1 minute left or less, say exactly: "The interview is now complete."
+      - If all sections are complete but no time signal has been received, ask 3 to 5 follow-up questions before saying: "The interview is now complete."
         Questions:
         {formatted}
       """,
