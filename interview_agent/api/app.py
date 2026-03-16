@@ -721,10 +721,10 @@ async def run_interview(websocket, applicant_id, interview_id, interview_app, du
             realtime_input_config=types.RealtimeInputConfig(
                 automatic_activity_detection=types.AutomaticActivityDetection(
                     disabled=False,
-                    start_of_speech_sensitivity=types.StartSensitivity.START_SENSITIVITY_HIGH,
-                    end_of_speech_sensitivity=types.EndSensitivity.END_SENSITIVITY_HIGH,
-                    prefix_padding_ms=20,
-                    silence_duration_ms=300,
+                    start_of_speech_sensitivity=types.StartSensitivity.START_SENSITIVITY_UNSPECIFIED,
+                    end_of_speech_sensitivity=types.EndSensitivity.END_SENSITIVITY_LOW,
+                    prefix_padding_ms=200,
+                    silence_duration_ms=900,
                 ),
             ),
             session_resumption=types.SessionResumptionConfig(handle=resumption_handle),
@@ -861,7 +861,7 @@ async def audio_interview(websocket: WebSocket, interview_id: str, applicant_id:
         Do NOT answer the user's questions.
         DO NOT interrupt user while they are giving the answer.(IMPORTANT)
         If the user's answer is vague, incomplete or missing, ask a new question for more details, or elaborate.
-
+        Ask follow-up questions but not too many, for the user to elaborate more
         DO NOT focus on one section but switch sections intelligently, such that they flow.
         DO NOT respond to noise.
         DO NOT ASK the same question twice.
@@ -875,8 +875,8 @@ async def audio_interview(websocket: WebSocket, interview_id: str, applicant_id:
         name="interview_app",
         root_agent=interview_agent,
         context_cache_config=ContextCacheConfig(
-            min_tokens=2048,
-            ttl_seconds=600,
+            min_tokens=512,
+            ttl_seconds=710,
             cache_intervals=5,
         ),
     )
