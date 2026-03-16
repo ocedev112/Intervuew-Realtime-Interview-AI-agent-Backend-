@@ -8,19 +8,17 @@ from google.adk.agents.llm_agent import Agent
 from google.adk.tools import FunctionTool
 from google.genai.types import GenerateContentConfig, ToolConfig, FunctionCallingConfig
 from google.adk.apps.app import App
-from google.adk.apps.app import EventsCompactionConfig
-from sentence_transformers import SentenceTransformer
 from pydantic import BaseModel
 from .Interview_information.vectorCollection import COLLECTION, client, get_encoder
 
 
-encoder = get_encoder()
+
 
 def create_base_interview_questions(job_requirements: str, n: int = 5):
     """
     Generate base questions with the job requirements
     """
- 
+    encoder = get_encoder()
     terms = [t.strip() for t in job_requirements.replace(',', ' ').split() if len(t) > 3]
     
     seen_ids = set()

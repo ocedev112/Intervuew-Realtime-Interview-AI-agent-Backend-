@@ -1,0 +1,29 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+.venv312/
+
+# Environment
+.env
+
+# Local databases
+interview_db/
+*.db
+orm.db
+
+# Model cache
+model_cache/
+
+# VS Code
+.vscode/
+
+# ADK
+.adk/
+
+# Docker
+*.dockerignore
+
+# OS
+.DS_Store
+Thumbs.db

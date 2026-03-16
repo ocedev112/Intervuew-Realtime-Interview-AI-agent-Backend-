@@ -1,4 +1,12 @@
+.venv/
+.venv312/
+interview_db/
+model_cache/
 .env
-.venv
-.vscode/
+__pycache__/
+*.pyc
+*.db
 .adk/
+.vscode/
+orm.db
+LICENSE

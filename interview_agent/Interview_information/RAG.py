@@ -5,10 +5,9 @@ from vectorCollection import create_collection, store
 from readability import Document
 from lxml import etree
 
-create_collection()
+
 
 response = requests.get("https://raw.githubusercontent.com/DopplerHQ/awesome-interview-questions/master/README.md")
-
 readme = response.text
 content = readme.split("## Programming Languages/Frameworks/Platforms")[1]
 
@@ -27,16 +26,11 @@ async def scrapeUrl(url: str, text: str) -> None:
             if response.status_code == 200:
                 doc = Document(response.text)
                 root = etree.fromstring(doc.summary(), etree.HTMLParser())
-                
-                # Remove noisy tags
                 for tag in root.xpath('//code|//pre|//table|//figure|//img|//script|//style'):
                     tag.getparent().remove(tag)
-                
                 plain_text = ' '.join(root.itertext())
                 plain_text = re.sub(r'\s+', ' ', plain_text).strip()
-                
-                document = {'title': text, 'url': url, 'content': plain_text}
-                documents.append(document)
+                documents.append({'title': text, 'url': url, 'content': plain_text})
     except Exception:
         return None
 
@@ -54,5 +48,8 @@ async def scrapeData():
     await addToVectorDatabase(documents)
     return results
 
-asyncio.run(scrapeData())
+if __name__ == "__main__":
+    create_collection()
+    asyncio.run(scrapeData())
+    print(f"Seeded {len(documents)} documents into Qdrant.")
 

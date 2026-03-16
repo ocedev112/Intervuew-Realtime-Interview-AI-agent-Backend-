@@ -49,6 +49,8 @@ client = genai.Client(
 )
 
 
+is_production = os.getenv("ENVIRONMENT") == "production"
+
 
 
 class UserRequest(BaseModel):
@@ -104,11 +106,11 @@ class ApplicantRequest(BaseModel):
 
 
 
-app =FastAPI()
+app = FastAPI(redirect_slashes=False)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[os.environ["ALLOWED_ORIGIN"]],  
+    allow_origins=os.environ["ALLOWED_ORIGIN"].split(","),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -178,8 +180,8 @@ async def create_user(request: UserRequest, response: Response):
         key="org_id",
         value=str(user.id),
         httponly=True,
-        secure=False,  
-        samesite="lax",
+        secure=is_production,  
+        samesite="none",
         max_age=60*60*24*7  
     )
     return {"status": "ok", "id": user.id}
@@ -190,18 +192,24 @@ async def create_user(request: UserRequest, response: Response):
 
 @app.get("/User")
 async def get_username(request: Request):
-   db= sessionLocal()
+   db = sessionLocal()
    try:
-       user_id = request.cookies.get("user_id")
+       user_id = request.headers.get("X-User-Id") or request.cookies.get("user_id")
        if not user_id:
           raise HTTPException(status_code=401, detail="Not authenticated")
        user = db.query(User).filter(User.id == user_id).first()
+       if not user:
+           raise HTTPException(status_code=404, detail="User not found")
+       
        return {"name": user.name}
+   except HTTPException:
+       raise
    except Exception as e:
        print(e)
-       raise HTTPException(status_code=500,detail=str(e))
+       raise HTTPException(status_code=500, detail=str(e))
    finally:
        db.close()
+       
 
 @app.get("/User/{user_id}/applicant/interviews")
 async def get_user_applicant(user_id: str):
@@ -238,8 +246,8 @@ async def login_user(request: UserLoginRequest, response: Response):
                     key="user_id",
                     value=user.id,
                     httponly=True,
-                    secure=False,  
-                    samesite="lax",
+                    secure=is_production,  
+                    samesite="none",
                     max_age=60*60*24*7  
                 )
                 return {"status": "ok", "id": str(user.id)}
@@ -273,7 +281,7 @@ async def get_interview_report(interview_id: str, request: Request):
 
 @app.get("/User/me")
 async def get_me(request: Request):
-    user_id = request.cookies.get("user_id")
+    user_id = request.headers.get("X-User-Id") or request.cookies.get("user_id")
     if not user_id:
         raise HTTPException(status_code=401, detail="Not authenticated")
     
@@ -282,6 +290,7 @@ async def get_me(request: Request):
         user = db.query(User).filter(User.id == user_id).first()
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
+        
         return {"id": user.id, "name": user.name, "email": user.email}
     except Exception as e:
         print(e)
@@ -294,7 +303,7 @@ async def get_me(request: Request):
 async def get_username(request: Request):
    db= sessionLocal()
    try:
-       org_id = request.cookies.get("org_id")
+       org_id = request.headers.get("X-Org-Id") or request.cookies.get("org_id")
        if not org_id:
           raise HTTPException(status_code=401, detail="Not authenticated")
        org = db.query(Organization).filter(Organization.id == org_id).first()
@@ -308,15 +317,15 @@ async def get_username(request: Request):
 
 @app.get("/Organization/me")
 async def get_org_me(request: Request):
-    org_id = request.cookies.get("org_id")
+    org_id = request.headers.get("X-Org-Id") or request.cookies.get("org_id")
     if not org_id:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    
     db = sessionLocal()
     try:
         org = db.query(Organization).filter(Organization.id == org_id).first()
         if not org:
             raise HTTPException(status_code=404, detail="Organization not found")
+       
         return {"id": str(org.id), "name": org.name, "email": org.email}
     finally:
         db.close()
@@ -332,8 +341,8 @@ async def create_organization(request: OrganizationRequest, response: Response):
         key="user_id",
         value=org.id,
         httponly=True,
-        secure=False,  
-        samesite="lax",
+        secure=is_production,  
+        samesite="none",
         max_age=60*60*24*7  
     )
     return {"status": "ok", "id" : org.id}
@@ -399,11 +408,11 @@ async def login_Orgainization(request: OrganizationLoginRequest, response: Respo
                     key="org_id",
                     value=org.id,
                     httponly=True,
-                    secure=False,  
-                    samesite="lax",
+                    secure=is_production,  
+                    samesite="none",
                     max_age=60*60*24*7  
                 )
-                
+            
                 return {"status": "ok", "id": org.id}
         raise HTTPException(status_code=401, detail="Invalid credentials")
     except HTTPException:
