@@ -1,4 +1,4 @@
-Intervuew is a full-stack AI interview platform that conducts live, voice-based technical interviews using Google's Gemini Live API. It supports two user types: **organizations** that create job roles and evaluate candidates, and **applicants** who practice or sit for real interviews with an AI interviewer that speaks, listens, and responds in real time.
+Intervuew is a full-stack AI interview platform that conducts live, voice-based technical interviews using Google's Gemini Live API.
 
 ## Features
 
