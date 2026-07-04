@@ -45,7 +45,7 @@ import base64
 from concurrent.futures import ThreadPoolExecutor 
 
 client = genai.Client(
-   api_key=os.environ["GOOGLE_API_KEY"]
+   api_key=" "
 )
 
 
